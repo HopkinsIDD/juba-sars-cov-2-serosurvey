@@ -1,0 +1,810 @@
+---
+title: 'Prevalence of anti-SARS-CoV-2 IgG antibodies in a representative sample from Juba, South Sudan'
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+## Setup for running serosurvey analysis
+
+```{r preamble, include=FALSE}
+# load packages
+pacman::p_load('tidyverse', 'rstan', 'doMC', 'bit64', 'stringr',
+               'grid', 'ggplot2', 'gridExtra', 'cowplot',
+               'flextable', 'data.table', 'openxlsx')
+
+# load functions
+source(here::here('code', 'utils.R'))
+
+# Stan settings
+options(mc.cores = parallel::detectCores()-2) # use all cores but two for this
+n_chains <- 4
+n_iter <- 1500
+n_warmup <- 250
+p_delta <- 0.99
+n_treedepth <- 20
+stan_redo <- TRUE # set this to TRUE to re-run the Stan models, FALSE to load previous model fits
+
+# seropositivity threshold (100% specificity in Juba population)
+seropos_thresh <- 0.32
+
+# assuming most infections will have happened 30 or more days in the past
+days_post_symptom <- 30
+
+# severity categories
+severity_cats <- c('Not Hospitalized', 'Hospitalized, no ICU',
+                   'Hospitalized, required ICU', 'Died due to COVID-19')
+
+# severity groups to test
+severity_groups <- list('allpos' = 'all_positive_control_data')
+for (i in seq(0.6, 1, by = 0.05)) {
+  severity_groups[[paste0('mild', i*100)]] <- c(i, # not hospitalized (mild)
+                                                (1-i)*0.5, # hospitalized, no ICU (severe)
+                                                (1-i)*0.5, # ICU (severe)
+                                                0) # death (not included)
+}
+
+# data table to save seroprevalence estimates in
+seroprev <- data.table(
+  analysis = names(severity_groups),
+  mean = '', lower = '', upper = ''
+)
+
+# set directory to save tables and figures in
+outdir <- here::here('results')
+```
+
+## Load and clean ELISA plate data
+
+```{r}
+# get analyzed plate data and save summary file
+ssd <- run_elisa_analysis(save_file = TRUE)
+```
+
+## Load serosurvey interview data and add serology results
+
+```{r}
+# interview/demographic data that can be matched to serological samples
+match <- fread(here::here('data', 'raw_data', 'juba_survey_data', 
+                          'juba_survey_sero_matched.csv'))
+
+# add serology results to matched data
+ssd_survey <- ssd[!grepl('C', sample_id)]
+ssd_survey[, sample_id := as.numeric(sample_id)]
+sero_match <- merge(ssd_survey, match,
+                    by.x = 'sample_id', by.y = 'PorchID', 
+                    all = TRUE) # keep the serology data that can't be matched
+sero_match[, barcode := NULL]
+setnames(sero_match, 'BarcodeID', 'barcode')
+```
+
+## Load and clean antibody dynamics data from Boston cohort
+
+```{r}
+# load data
+mgh <- clean_serodynamics_data()
+```
+
+## Prepare epi data for Stan model
+
+```{r epi data}
+# Juba age data
+ssd_ages <- fread(here::here('data', 'raw_data', 'population_data', 
+                             'ssd_urban_age_sex.csv'))
+ssd_ages[, men := sum(men/100*510000), by = age_cat]
+ssd_ages[, women := sum(women/100*510000), by = age_cat]
+ssd_ages <- unique(ssd_ages[, c('age_cat', 'men', 'women')])
+
+# Juba serology data
+sero_dat <- sero_match[, c('sample_id', 'igg', 'age', 'sex')]
+
+# rename some variables
+setnames(sero_dat, 'sample_id', 'ind_id')
+
+# add infection status based on threshold
+sero_dat[, pos := ifelse(igg > seropos_thresh, 1, 0)]
+sero_dat[, neg := ifelse(igg < seropos_thresh, 1, 0)]
+
+# age categories
+age_cats <- c('[1,5)', '[5,10)', '[10,20)', '[20,50)', '[50,65)', '[65,105)')
+age_cats_dt <- data.table(age_cat = age_cats,
+                          age_lower = c(1, 5, 10, 20, 50, 65),
+                          age_upper = c(5, 10, 20, 50, 65, 105))
+
+# summarize by age cat
+sero_dat[, age_cat := lapply(age, function(x) {
+  age_cats_dt[age_lower <= x & age_upper > x, age_cat]
+})]
+sero_dat$age_cat <- as.character(sero_dat$age_cat)
+
+# merge
+ssd_ages <- merge(age_cats_dt, ssd_ages, by = c('age_cat'))
+
+# find population-level proportions of age and sex
+ssd_age_cats <- ssd_ages %>%
+  mutate(
+    age_med = (age_lower + age_upper) / 2
+  ) %>%
+  filter(age_cat %in% age_cats) %>%
+  group_by(age_cat) %>%
+  summarize(
+    male = sum(men),
+    female = sum(women)
+  ) %>%
+  pivot_longer(
+    cols = -age_cat,
+    names_to = 'sex',
+    values_to = 'pop'
+  ) %>%
+  mutate(
+    sex = ifelse(sex == 'male', 1, 0),
+    pct = pop / sum(pop)
+  ) %>%
+  full_join(
+    expand_grid(
+      sex = 0:1
+    )
+  ) 
+```
+
+## Prepare validation data for Stan model
+
+```{r validation data}
+# prep lab validation data
+ssd_val_dat <- ssd[grepl('C', sample_id)]
+mgh_val_dat <- mgh[cohort == 'case' & (dos >= days_post_symptom)]
+mgh_val_dat[, row_id := .I]
+
+# number of negative controls
+# Juba survey
+neg_control <- nrow(ssd_val_dat)
+
+# false positive rate for controls (1-specificity)
+control_fp <- nrow(ssd_val_dat[igg > seropos_thresh])
+```
+
+## Model with all data (no age/sex covariates)
+
+```{r}
+# select run to test this for
+run_id <- 'mild80-alldata'
+severity_probs <- severity_groups[['mild80']]
+message('Running analysis: ', run_id)
+
+# file to save to
+out_est_file <- here::here('data', 'generated_data', 'adjusted_prev', 
+                           paste0('seropos-', run_id, '.rds'))
+
+# positive control validation data
+pos_controls <- get_pos_val_data(run_id, mgh_val_dat, severity_probs)
+
+# run model
+if (!file.exists(out_est_file) | stan_redo) {
+  seropos <- run_analysis_stan(
+    model_script = here::here('code', 'serosurvey-analysis.stan'),
+    dat = sero_dat,
+    run_id = run_id,
+    coef_eqn = '1',
+    pos_control = pos_controls[1],
+    neg_control = neg_control,
+    control_tp = pos_controls[2],
+    control_fp = control_fp,
+    pop_age_cats = ssd_age_cats,
+    chains = n_chains,
+    iter = n_iter,
+    warmup = n_warmup,
+    control = list(
+      adapt_delta = p_delta,
+      max_treedepth = n_treedepth
+    ),
+    save_warmup = F,
+    redo = stan_redo
+  )
+  
+  saveRDS(seropos, out_est_file)
+  
+} else {
+  seropos <- readRDS(out_est_file)
+}
+
+# save seroprevalence results
+subset_est <- seropos$subset_est
+vals <- subset_est[var == 'Overall', p]
+
+seroprev <- rbind(seroprev, data.frame(a = run_id,
+                                       b = mean(vals, na.rm = T),
+                                       c = quantile(vals, probs = .025, na.rm = T),
+                                       d = quantile(vals, probs = .975, na.rm = T)),
+                          use.names = FALSE)
+```
+
+## Model with matched data (no age/sex covariates)
+
+```{r}
+# select run to test this for
+run_id <- 'mild80-nocovs'
+severity_probs <- severity_groups[['mild80']]
+message('Running analysis: ', run_id)
+
+# file to save to
+out_est_file <- here::here('data', 'generated_data', 'adjusted_prev', 
+                           paste0('seropos-', run_id, '.rds'))
+
+# positive control validation data
+pos_controls <- get_pos_val_data(run_id, mgh_val_dat, severity_probs)
+
+# run model
+if (!file.exists(out_est_file) | stan_redo) {
+  seropos <- run_analysis_stan(
+    model_script = here::here('code', 'serosurvey-analysis.stan'),
+    dat = sero_dat[!is.na(sex)], # just the matched data
+    run_id = run_id,
+    coef_eqn = '1',
+    pos_control = pos_controls[1],
+    neg_control = neg_control,
+    control_tp = pos_controls[2],
+    control_fp = control_fp,
+    pop_age_cats = ssd_age_cats,
+    chains = n_chains,
+    iter = n_iter,
+    warmup = n_warmup,
+    control = list(
+      adapt_delta = p_delta,
+      max_treedepth = n_treedepth
+    ),
+    save_warmup = F,
+    redo = stan_redo
+  )
+  
+  saveRDS(seropos, out_est_file)
+  
+} else {
+  seropos <- readRDS(out_est_file)
+}
+
+# save seroprevalence results
+subset_est <- seropos$subset_est
+vals <- subset_est[var == 'Overall', p]
+
+seroprev <- rbind(seroprev, data.frame(a = run_id,
+                                       b = mean(vals, na.rm = T),
+                                       c = quantile(vals, probs = .025, na.rm = T),
+                                       d = quantile(vals, probs = .975, na.rm = T)),
+                          use.names = FALSE)
+```
+
+## Main modeled results (with age/sex data) and impact of assumptions
+
+```{r re-stan, cache=F, eval=T}
+# loop over severity groups
+for (i in 1:length(severity_groups)) {
+  
+  # set arguments
+  run_id <- names(severity_groups)[[i]]
+  severity_probs <- severity_groups[[i]]
+  message('Running analysis: ', run_id)
+ 
+  # file to save to
+  out_est_file <- here::here('data', 'generated_data', 'adjusted_prev', 
+                             paste0('seropos-', run_id, '.rds'))
+  
+  # positive control validation data
+  pos_controls <- get_pos_val_data(run_id, mgh_val_dat, severity_probs)
+  
+  if (!file.exists(out_est_file) | stan_redo) {
+    seropos <- run_analysis_stan(
+      model_script = here::here('code', 'serosurvey-analysis.stan'),
+      dat = sero_dat[!is.na(sex)], # just the matched data
+      run_id = run_id,
+      coef_eqn = 'sex + age_cat',
+      pos_control = pos_controls[1],
+      neg_control = neg_control,
+      control_tp = pos_controls[2],
+      control_fp = control_fp,
+      pop_age_cats = ssd_age_cats,
+      chains = n_chains,
+      iter = n_iter,
+      warmup = n_warmup,
+      control = list(
+        adapt_delta = p_delta,
+        max_treedepth = n_treedepth
+      ),
+      save_warmup = F,
+      redo = stan_redo
+    )
+    
+    saveRDS(seropos, out_est_file)
+    
+  } else {
+    seropos <- readRDS(out_est_file)
+  }
+  
+  # save seroprevalence results
+  subset_est <- seropos$subset_est
+  vals <- subset_est[var == 'Overall', p]
+  
+  seroprev[analysis == run_id, mean := mean(vals, na.rm = T)]
+  seroprev[analysis == run_id, lower := quantile(vals, probs = .025, na.rm = T)]
+  seroprev[analysis == run_id, upper := quantile(vals, probs = .975, na.rm = T)]
+}
+```
+
+## Results by age/sex
+
+```{r tables}
+# pull results for the main analysis
+seropos <- readRDS(here::here('data', 'generated_data', 'adjusted_prev', 
+                                 paste0('seropos-mild80.rds')))
+subset_est <- seropos$subset_est
+
+# overall seroprevalence by age and sex
+age_sex_seroprev <- subset_est[var == 'Age' | var == 'sex']
+age_sex_seroprev[, mean := mean(p, na.rm = T), by = 'val']
+age_sex_seroprev[, lower := quantile(p, probs = .025, na.rm = T), by = 'val']
+age_sex_seroprev[, upper := quantile(p, probs = .975, na.rm = T), by = 'val']
+age_sex_seroprev <- unique(age_sex_seroprev[, c('val', 'mean', 'lower', 'upper')])
+
+# relative risk by age and sex
+rr_by_age <-
+  subset_est %>%
+  filter(var == 'Age') %>%
+  group_by(sim) %>%
+  mutate(rr = ifelse(val == '[20,50)', NA, p / p[val == '[20,50)'])) %>%
+  ungroup() %>%
+  left_join(sero_dat %>%
+    group_by(age_cat) %>%
+    summarize(
+      n = n(),
+      pos = sum(pos),
+      neg = sum(neg)
+    ),
+  by = c('val' = 'age_cat')
+  ) %>%
+  bind_rows(
+    subset_est %>%
+    filter(var == 'sex') %>%
+    group_by(sim) %>%
+    mutate(rr = ifelse(val == 0, NA, p / p[val == 0])) %>%
+    ungroup() %>%
+    mutate(val = ifelse(val == 0, 'Female', 'Male')) %>%
+    left_join(sero_dat %>%
+      mutate(val = ifelse(sex == 'male', 'Male', 'Female')) %>%
+      group_by(val) %>%
+      summarize(
+        n = n(),
+        pos = sum(pos),
+        neg = sum(neg)
+      ))) %>%
+  group_by(var, val, n, pos, neg) %>%
+  summarize(
+    `Relative risk (95% CI)` = ifelse(is.na(mean(rr)), '--',
+      paste0(
+        mean(rr, na.rm = T) %>%
+          formatC(2, format = 'f'),
+        ' (', quantile(rr, probs = .025, na.rm = T) %>%
+          formatC(2, format = 'f'), '-',
+        quantile(rr, probs = .975, na.rm = T) %>%
+          formatC(2, format = 'f'), ')'
+      )
+    ),
+    p = ifelse(is.na(mean(rr)), '--',
+      min(2 * c(
+        mean(rr > 1, na.rm = T),
+        mean(rr < 1, na.rm = T)
+      )) %>%
+        formatC(3, format = 'f')
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pos = paste0(pos, ' (', formatC(100 * pos / n, 1, format = 'f'), '%)'),
+    neg = paste0(neg, ' (', formatC(100 * neg / n, 1, format = 'f'), '%)')
+  ) %>%
+  rename(
+    `Test positive` = pos, `Test negative` = neg,
+    Obs = n, Category = val
+  )
+```
+
+```{r save results}
+# save results if these are a new model run
+if (stan_redo) {
+  write.csv(seroprev, here::here('data', 'generated_data', 'adjusted_prev',
+                               paste0('seroprev_summary_', Sys.Date(), '.csv')))
+  write.csv(rr_by_age, here::here('data', 'generated_data', 'adjusted_prev',
+                                paste0('rr_by_age_', Sys.Date(), '.csv')))
+  write.csv(age_sex_seroprev, here::here('data', 'generated_data', 'adjusted_prev',
+                                       paste0('age_sex_seroprev_', Sys.Date(), '.csv')))
+}
+```
+
+## Table 1. Participant characteristics (interview data)
+
+```{r}
+# simplified matched interview data for table
+pc <- match[, c('BarcodeID', 'sex', 'age', 'payam', 'occupation',
+                'covid_tested', 'covid_tested_positive_result')]
+
+# age
+age_groups <- list(
+ '1 - 4 years' = 1:4,
+ '5 - 9 years' = 5:9,
+ '10 - 19 years' = 10:19,
+ '20 - 49 years' = 20:49,
+ '50 - 64 years' = 50:64,
+ '> 65 years' = 65:max(pc$age)
+)
+for (i in names(age_groups)) {
+  age_groups[[i]] <- data.table(age_groups[[i]])
+  age_groups[[i]][, age_group := i]
+}
+dt_ag <- rbindlist(age_groups)
+setnames(dt_ag, 'V1', 'age')
+
+# sample size
+sample_size <- nrow(pc)
+
+# add age groups
+pc <- merge(pc, dt_ag, by = 'age')
+
+# reshape
+pc <- melt(pc,  measure.vars = c('sex', 'age_group', 'payam', 'occupation',
+                                 'covid_tested', 'covid_tested_positive_result'), 
+             id.vars = 'BarcodeID')
+
+# clean up covid test results
+pc[variable == 'covid_tested_positive_result', value := paste0('Result_', value)]
+
+# summarize
+pc <- pc[, N := length(BarcodeID), by = value]
+pc <- unique(pc[, c('variable', 'value', 'N')])
+pc[, `%` := round(N/sample_size*100, 1), by = value] 
+
+# clean up
+pc[, variable := str_to_title(variable)]
+pc[variable == 'Sex' | variable == 'Covid_tested' | variable == 'Occupation', 
+     value := str_to_title(value)]
+pc[variable == 'Age_group', variable := 'Age']
+pc[variable == 'Covid_tested_positive_result', variable := 'SARS-CoV-2 test result']
+pc[variable == 'Covid_tested', variable := 'Tested for SARS-CoV-2']
+pc[, value := gsub('_', ' ', value)]
+pc[value == 'Result no', value := 'Negative']
+pc[value == 'Result yes', value := 'Positive']
+pc[value == 'Result unknown', value := 'Unknown']
+pc[value == 'Other  specify', value := 'Other']
+
+# rename
+setnames(pc, c('variable', 'value'), c('Characteristic', 'Group'))
+
+# make table
+table1 <- flextable(pc) %>%
+  autofit() %>%
+  merge_v(j = 'Characteristic') %>%
+  valign(valign = 'top')
+
+save_as_docx(table1, path = paste0(outdir, '/table1.docx'))
+```
+
+## Table S1. Seroprevalence for different subsets of the data
+
+```{r}
+# format
+cols <- c('mean', 'lower', 'upper')
+sero_tab <- seroprev[analysis %in% c('mild80', 'mild80-alldata', 'mild80-nocovs')]
+sero_tab[, (cols) := lapply(.SD, function(x) round(as.numeric(x), 3)*100), .SDcols = cols]
+sero_tab[, analysis := c('Primary (age/sex-matched data, n = 1840)',
+                         'No covariates (full dataset, n = 2214)',
+                         'No covariates (age/sex-matched data, n = 1840)')]
+sero_tab[, `Seroprevalence (95% CrI)` := paste0(mean, ' (', lower, ' - ', upper, ')')]
+setnames(sero_tab, 'analysis', 'Analysis')
+sero_tab[, (cols) := NULL]
+
+# table
+tableS1 <- flextable(sero_tab) %>%
+  autofit() %>%
+  valign(valign = 'top')
+
+save_as_docx(tableS1, path = paste0(outdir, '/tableS1.docx'))
+```
+
+## Table 2. Relative risk and seropositivity by age group
+
+```{r}
+# relative risk
+rr_tab <- data.table(rr_by_age)
+rr_tab[, row_order := c(1, 3, 4, 2, 5, 6, 7, 8)]
+setorderv(rr_tab, 'row_order')
+rr_tab[, row_order := NULL]
+rr_tab[, Category := c('1 - 4 years', '5 - 9 years', '10 - 19 years', '20 - 49 years',
+                       '50 - 64 years', '65 - 84 years', 'Female', 'Male')]
+
+# seropositivity
+age_sex_sero <- copy(age_sex_seroprev)
+cols <- c('mean', 'lower', 'upper')
+age_sex_sero[, row_order := c(7, 8, 1, 3, 4, 2, 5, 6)]
+setorderv(age_sex_sero, 'row_order')
+age_sex_sero[, row_order := NULL]
+age_sex_sero[, (cols) := lapply(.SD, function(x) round(x, 3)*100), .SDcols = cols]
+age_sex_sero[, `Seroprevalence (95% CrI)` := paste0(mean, ' (', lower, ' - ', upper, ')')]
+age_sex_sero[, (cols) := NULL]
+
+# combine
+tab2 <- cbind(rr_tab[, 2:5], age_sex_sero[, 2], rr_tab[, 6:7])
+
+# table
+table2 <- flextable(tab2) %>%
+  autofit() %>%
+  valign(valign = 'top')
+
+save_as_docx(table2, path = paste0(outdir, '/table2.docx'))
+```
+
+## Relative risk of seropositivity by occupation
+
+```{r}
+# create a variable for working vs. non-working
+oc <- copy(sero_match)
+oc[, pos := ifelse(igg > 0.32, 1, 0)]
+oc[, unemployed := ifelse(occupation == 'none', 1, 0)]
+
+# fit log-binomial model
+fit <- glm(pos ~ unemployed, data = oc,
+           family = binomial(link = 'log'))
+
+# report RR results
+exp(coef(fit))
+exp(confint(fit))
+```
+
+## Figure 2. Impact of assumptions on adjusted prevalence and number unreported
+
+```{r}
+# prep data
+plot_dt <- seroprev[!grep('allpos|alldata|nocovs|hh', analysis)]
+plot_dt[, analysis := gsub('mild', '', analysis)]
+plot_dt[, (names(plot_dt)) := lapply(.SD, as.numeric), .SDcols = names(plot_dt)]
+
+# plot
+ggplot(plot_dt) +
+  geom_point(aes(x = analysis, y = mean*100), size = 2) +
+  geom_errorbar(aes(x = analysis, ymin = lower*100, ymax = upper*100),
+                width = 1, size = 0.5) +
+  theme_bw() + 
+  geom_text(x = 92, y = 0.235, label = 'Unadjusted seropositivity') +
+  geom_hline(yintercept = 22.3, linetype = 'dashed') +
+  xlab('Assumed percent of infections that are mild') +
+  ylab('Adjusted seroprevalence (%)') +
+  ggtitle('Seroprevalence') -> p2
+
+# cumulative cases through the end of august
+reported_cases <- 1873
+
+# calcualte ratio
+im1 <- copy(plot_dt)
+cols <- c('mean', 'lower', 'upper')
+im1[, (cols) := lapply(.SD, function(x) {
+    return((x*510000 - reported_cases)/reported_cases)
+  }), .SDcols = cols]
+
+# plot ratio
+ggplot(im1) +
+  geom_point(aes(x = analysis, y = mean), size = 2) +
+  geom_errorbar(aes(x = analysis, ymin = lower, ymax = upper),
+                width = 1, size = 0.5) +
+  theme_bw() +
+  ylab('Unreported:reported infections') +
+  xlab('Assumed percent of infections that are mild') +
+  ggtitle('Ratio of unreported infections') -> p3
+
+# arrange
+pdf(paste0(outdir, '/fig2.pdf'), width = 6, height = 6)
+print(grid.arrange(arrangeGrob(p2, left = textGrob("a)", x = unit(1, "npc"), 
+                               y = unit(.95, "npc"))), 
+                   arrangeGrob(p3, left=textGrob("b)", x = unit(1, "npc"), 
+                               y = unit(.95, "npc"))), 
+                   ncol = 1))
+dev.off()
+
+# report range lower
+message('Mild percent: ', plot_dt[1, analysis])
+message('--> Seroprevalence (95% CI): ', paste0(round(plot_dt[1, mean]*100, 1), ' (', 
+                                                round(plot_dt[1, lower]*100, 1), ' - ', 
+                                                round(plot_dt[1, upper]*100, 1), ')'))
+
+# main result
+message('Mild percent: ', plot_dt[5, analysis])
+message('--> Seroprevalence (95% CI): ', paste0(round(plot_dt[5, mean]*100, 1), ' (', 
+                                                round(plot_dt[5, lower]*100, 1), ' - ', 
+                                                round(plot_dt[5, upper]*100, 1), ')'))
+
+# report range upper
+message('Mild percent: ', plot_dt[nrow(plot_dt), analysis])
+message('--> Seroprevalence (95% CI): ', paste0(round(plot_dt[nrow(plot_dt), mean]*100, 1), ' (', 
+                                                round(plot_dt[nrow(plot_dt), lower]*100, 1), ' - ', 
+                                                round(plot_dt[nrow(plot_dt), upper]*100, 1), ')'))
+
+# report range lower for ratio
+message('Mild percent: ', im1[1, analysis])
+message('--> Ratio: ', paste0(round(im1[1, mean]), ' (', 
+                              round(im1[1, lower]), ' - ', 
+                              round(im1[1, upper]), ')'))
+
+# main result for ratio
+message('Mild percent: ', im1[5, analysis])
+message('--> Ratio: ', paste0(round(im1[5, mean]), ' (', 
+                              round(im1[5, lower]), ' - ', 
+                              round(im1[5, upper]), ')'))
+
+# report range upper for ratio
+message('Mild percent: ', im1[nrow(plot_dt), analysis])
+message('--> Ratio: ', paste0(round(im1[nrow(im1), mean]), ' (', 
+                              round(im1[nrow(plot_dt), lower]), ' - ', 
+                              round(im1[nrow(plot_dt), upper]), ')'))
+```
+
+## Figure S2. Serodynamics by severity in Boston positive controls
+
+```{r}
+# prep data for plotting
+plot_dt <- copy(mgh)
+plot_dt <- plot_dt[, c('id', 'cohort', 'dos', 'severity', 'new_data', 'igg')]
+
+plot_dt[cohort == 'prepandemic', severity := 'Controls']
+plot_controls <- plot_dt[cohort == 'prepandemic']
+plot_controls[, dos := NULL]
+plot_controls[, dos := '126'] # for spacing on plot
+
+plot_dt <- plot_dt[cohort != 'prepandemic']
+
+plot_dt[, severity := factor(severity, levels = c('Controls', 'Not Hospitalized', 
+                                                  'Hospitalized, no ICU', 'Hospitalized, required ICU', 
+                                                  'Died due to COVID-19', 'Missing'))]
+
+# cohort data
+ggplot(plot_dt, aes(x=dos, y=igg, colour = as.factor(new_data)))+
+    geom_point(alpha=0.4,
+               size=0.8,
+               shape=16) + 
+    geom_smooth(data = plot_dt[dos >= 0 & dos <= 70],
+                se=FALSE,alpha=0.3,
+                method='loess',
+                fullrange = TRUE,
+                xseq = seq(0,100, length=200)
+    ) +
+    geom_line(aes(group=id), alpha=0.05,size=0.3)+
+    xlab('Days since symptom onset')+ ylab('') +
+    ylab('IgG (ug/mL)') +
+    scale_x_continuous(breaks = seq(0,126,14))+
+    theme_cowplot()+
+    theme(
+      panel.grid.minor.x = element_blank(),
+      legend.position = 'none',
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      axis.text.y = element_blank()
+    ) +
+    scale_y_continuous(breaks = c(0.1,10,1000),
+                       labels = c(0.1,10,1000),
+                       trans='log10',limits = c(0.01,1200)) +
+    scale_color_manual(values=c('black', 'purple')) +
+    facet_grid(~ severity, scales = 'free') -> p4
+
+# control data
+ggplot(plot_controls, aes(x=dos, y=igg))+
+    geom_jitter(alpha=0.4,
+                height = 0, width = 0.5,
+                size=0.8,
+                shape=16) +
+    xlab('g ') + # for spacing
+    ylab('IgG (ug/mL)') +
+    theme_cowplot()+
+    theme(
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      legend.position = 'none'
+    ) +
+    scale_y_continuous(breaks = c(0.1,10,1000),
+                       labels = c(0.1,10,1000),
+                       trans='log10',limits = c(0.01,1200)) +
+    facet_grid(~ severity, scales = 'free') -> p5
+
+# save
+pdf(paste0(outdir, '/figS2.pdf'), width = 11, height = 3.5)
+lay <- rbind(c(1, 2, 2, 2, 2))
+grid.arrange(grobs = list(p5, p4), layout_matrix = lay, nrow = 1)
+dev.off()
+```
+
+## Figures S1 and S3. IgG distributions by cohort pre and post pandemic
+
+```{r igg distributions}
+# Boston prepandemic controls
+boston <- mgh[cohort == 'prepandemic']
+
+# Juba samples
+juba_pre <- ssd[grep('C', sample_id)]
+juba_post <- ssd[!grep('C', sample_id)]
+
+# rename for plotting
+setnames(juba_pre, 'sample_id', 'id')
+juba_pre[, case := 0]
+
+# limits for plots
+lims <- c(min(juba_pre$igg), max(juba_post$igg))
+
+# plot histogram of pre-pandemic controls
+ggplot(juba_pre, aes(igg)) +
+  geom_histogram(binwidth = 0.05, color = 'black', fill = 'black', alpha = 0.2) +
+  theme_classic() + labs(y = 'Number of samples', x = 'IgG titer (ug/mL)') +
+  ggtitle('Juba pre-pandemic controls') +
+  geom_vline(xintercept = seropos_thresh, color = '#9966CC', linetype='dashed') +
+  scale_x_continuous(trans = 'log10', limits = lims) -> p6
+
+# plot
+ggplot(juba_post, aes(igg)) +
+  geom_histogram(binwidth = 0.05, color = 'black', fill = 'black', alpha = 0.2) +
+  theme_classic() + labs(y = 'Number of samples', x = 'IgG titer (ug/mL)') +
+  ggtitle('Juba serological survey samples') +
+  geom_vline(xintercept = seropos_thresh, color = '#9966CC', linetype='dashed') +
+  scale_x_continuous(trans = 'log10', limits = lims) -> p7
+
+# save
+pdf(paste0(outdir, '/figS1.pdf'), width = 6, height = 4)
+print(grid.arrange(p6, p7, nrow = 2))
+dev.off()
+
+# report crude seroprevalence
+num_pos <- nrow(juba_post[igg > seropos_thresh])
+num_total <- nrow(juba_post)
+
+message(num_pos, '/', num_total, ' (', round(num_pos/num_total*100, 1), 
+        '%) of DBS samples were seropositive')
+
+# combine
+boston[, City := 'Boston']
+juba_pre[, City := 'Juba']
+controls <- rbindlist(list(boston[, c('City', 'igg')], 
+                           juba_pre[, c('City', 'igg')]), 
+                      use.names = T, fill = T)
+
+ggplot(controls, aes(x = City, y = igg, color = City)) +
+  geom_jitter(size = 1) + theme_classic() +
+  ylab('IgG titer (ug/mL)') +
+  scale_color_manual(values = c('#339966', '#9966CC'))  +
+  theme(legend.position = 'none') + xlab('') +
+  ggtitle('Pre-pandemic controls') +
+  geom_hline(yintercept = min(controls$igg), linetype='dotted') +
+  scale_y_continuous(trans = 'log10') -> p8
+
+# save
+pdf(paste0(outdir, '/figS3.pdf'), width = 6, height = 4)
+print(p8)
+dev.off()
+```
+
+## Figure S4. IgG distributions by age group in Juba
+
+```{r}
+# data
+ab_age <- merge(sero_match, dt_ag, by = 'age')
+ab_age[, age_group := factor(age_group, levels = unique(ab_age$age_group))]
+
+# plot histogram
+ggplot(ab_age, aes(igg)) +
+  geom_histogram(binwidth = 0.05, color = 'black', fill = 'black', alpha = 0.2) +
+  theme_classic() + labs(y = 'Number of samples', x = 'IgG titer (ug/mL)') +
+  geom_vline(xintercept = seropos_thresh, color = '#9966CC', linetype='dashed') +
+  scale_x_continuous(trans = 'log10') +
+  facet_wrap(~age_group, nrow = 3, scales = 'free') -> p9
+
+# save
+pdf(paste0(outdir, '/figS4.pdf'), width = 8, height = 6)
+print(p9)
+dev.off()
+```
