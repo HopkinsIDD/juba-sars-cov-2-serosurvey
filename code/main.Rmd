@@ -807,4 +807,7 @@ ggplot(ab_age, aes(igg)) +
 pdf(paste0(outdir, '/figS4.pdf'), width = 8, height = 6)
 print(p9)
 dev.off()
+
+# report session
+sessionInfo()
 ```
