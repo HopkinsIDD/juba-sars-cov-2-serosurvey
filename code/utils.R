@@ -309,6 +309,39 @@ get_pos_val_data <- function(run_id,
 }
 
 
+#' @title Find population-level proportions of age and sex
+#'
+#' @param pop_dt data with population counts by age/sex
+#' 
+#' @return data with population proportions by age/sex
+get_pop_props <- function(pop_dt) {
+  pop_dt %>%
+    mutate(
+      age_med = (age_lower + age_upper) / 2
+    ) %>%
+    filter(age_cat %in% age_cats) %>%
+    group_by(age_cat) %>%
+    summarize(
+      male = sum(men),
+      female = sum(women)
+    ) %>%
+    pivot_longer(
+      cols = -age_cat,
+      names_to = 'sex',
+      values_to = 'pop'
+    ) %>%
+    mutate(
+      sex = ifelse(sex == 'male', 1, 0),
+      pct = pop / sum(pop)
+    ) %>%
+    full_join(
+      expand_grid(
+        sex = 0:1
+      )
+    ) 
+}
+
+
 #' @title Run Stan analysis
 #' @description Runs the Stan seroprevalence model
 #'
@@ -493,4 +526,72 @@ run_analysis_stan <- function(model_script,
   )
   
   return(res)
+}
+
+
+#' @title Summarize relative risk of seropositivity by age and sex
+#'
+#' @param est seroprevalence estimats by age and sex
+#' @param age_ref reference category for age
+#' 
+#' @return relative risk table
+get_rr_by_group <- function(est, age_ref = '[20,50)') {
+  est %>%
+    filter(var == 'Age') %>%
+    group_by(sim) %>%
+    mutate(rr = ifelse(val == age_ref, NA, p / p[val == age_ref])) %>%
+    ungroup() %>%
+    left_join(sero_dat %>%
+                group_by(age_cat) %>%
+                summarize(
+                  n = n(),
+                  pos = sum(pos),
+                  neg = sum(neg)
+                ),
+              by = c('val' = 'age_cat')
+    ) %>%
+    bind_rows(
+      subset_est %>%
+        filter(var == 'sex') %>%
+        group_by(sim) %>%
+        mutate(rr = ifelse(val == 0, NA, p / p[val == 0])) %>%
+        ungroup() %>%
+        mutate(val = ifelse(val == 0, 'Female', 'Male')) %>%
+        left_join(sero_dat %>%
+                    mutate(val = ifelse(sex == 'male', 'Male', 'Female')) %>%
+                    group_by(val) %>%
+                    summarize(
+                      n = n(),
+                      pos = sum(pos),
+                      neg = sum(neg)
+                    ))) %>%
+    group_by(var, val, n, pos, neg) %>%
+    summarize(
+      `Relative risk (95% CI)` = ifelse(is.na(mean(rr)), '--',
+                                        paste0(
+                                          mean(rr, na.rm = T) %>%
+                                            formatC(2, format = 'f'),
+                                          ' (', quantile(rr, probs = .025, na.rm = T) %>%
+                                            formatC(2, format = 'f'), '-',
+                                          quantile(rr, probs = .975, na.rm = T) %>%
+                                            formatC(2, format = 'f'), ')'
+                                        )
+      ),
+      p = ifelse(is.na(mean(rr)), '--',
+                 min(2 * c(
+                   mean(rr > 1, na.rm = T),
+                   mean(rr < 1, na.rm = T)
+                 )) %>%
+                   formatC(3, format = 'f')
+      )
+    ) %>%
+    ungroup() %>%
+    mutate(
+      pos = paste0(pos, ' (', formatC(100 * pos / n, 1, format = 'f'), '%)'),
+      neg = paste0(neg, ' (', formatC(100 * neg / n, 1, format = 'f'), '%)')
+    ) %>%
+    rename(
+      `Test positive` = pos, `Test negative` = neg,
+      Obs = n, Category = val
+    )
 }

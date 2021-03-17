@@ -30,7 +30,7 @@ n_iter <- 1500
 n_warmup <- 250
 p_delta <- 0.99
 n_treedepth <- 20
-stan_redo <- TRUE # set this to TRUE to re-run the Stan models, FALSE to load previous model fits
+stan_redo <- FALSE # set this to TRUE to re-run the Stan models, FALSE to load previous model fits
 
 # seropositivity threshold (100% specificity in Juba population)
 seropos_thresh <- 0.32
@@ -128,30 +128,7 @@ sero_dat$age_cat <- as.character(sero_dat$age_cat)
 ssd_ages <- merge(age_cats_dt, ssd_ages, by = c('age_cat'))
 
 # find population-level proportions of age and sex
-ssd_age_cats <- ssd_ages %>%
-  mutate(
-    age_med = (age_lower + age_upper) / 2
-  ) %>%
-  filter(age_cat %in% age_cats) %>%
-  group_by(age_cat) %>%
-  summarize(
-    male = sum(men),
-    female = sum(women)
-  ) %>%
-  pivot_longer(
-    cols = -age_cat,
-    names_to = 'sex',
-    values_to = 'pop'
-  ) %>%
-  mutate(
-    sex = ifelse(sex == 'male', 1, 0),
-    pct = pop / sum(pop)
-  ) %>%
-  full_join(
-    expand_grid(
-      sex = 0:1
-    )
-  ) 
+ssd_age_cats <- get_pop_props(ssd_ages)
 ```
 
 ## Prepare validation data for Stan model
@@ -352,65 +329,7 @@ age_sex_seroprev[, upper := quantile(p, probs = .975, na.rm = T), by = 'val']
 age_sex_seroprev <- unique(age_sex_seroprev[, c('val', 'mean', 'lower', 'upper')])
 
 # relative risk by age and sex
-rr_by_age <-
-  subset_est %>%
-  filter(var == 'Age') %>%
-  group_by(sim) %>%
-  mutate(rr = ifelse(val == '[20,50)', NA, p / p[val == '[20,50)'])) %>%
-  ungroup() %>%
-  left_join(sero_dat %>%
-    group_by(age_cat) %>%
-    summarize(
-      n = n(),
-      pos = sum(pos),
-      neg = sum(neg)
-    ),
-  by = c('val' = 'age_cat')
-  ) %>%
-  bind_rows(
-    subset_est %>%
-    filter(var == 'sex') %>%
-    group_by(sim) %>%
-    mutate(rr = ifelse(val == 0, NA, p / p[val == 0])) %>%
-    ungroup() %>%
-    mutate(val = ifelse(val == 0, 'Female', 'Male')) %>%
-    left_join(sero_dat %>%
-      mutate(val = ifelse(sex == 'male', 'Male', 'Female')) %>%
-      group_by(val) %>%
-      summarize(
-        n = n(),
-        pos = sum(pos),
-        neg = sum(neg)
-      ))) %>%
-  group_by(var, val, n, pos, neg) %>%
-  summarize(
-    `Relative risk (95% CI)` = ifelse(is.na(mean(rr)), '--',
-      paste0(
-        mean(rr, na.rm = T) %>%
-          formatC(2, format = 'f'),
-        ' (', quantile(rr, probs = .025, na.rm = T) %>%
-          formatC(2, format = 'f'), '-',
-        quantile(rr, probs = .975, na.rm = T) %>%
-          formatC(2, format = 'f'), ')'
-      )
-    ),
-    p = ifelse(is.na(mean(rr)), '--',
-      min(2 * c(
-        mean(rr > 1, na.rm = T),
-        mean(rr < 1, na.rm = T)
-      )) %>%
-        formatC(3, format = 'f')
-    )
-  ) %>%
-  ungroup() %>%
-  mutate(
-    pos = paste0(pos, ' (', formatC(100 * pos / n, 1, format = 'f'), '%)'),
-    neg = paste0(neg, ' (', formatC(100 * neg / n, 1, format = 'f'), '%)')
-  ) %>%
-  rename(
-    `Test positive` = pos, `Test negative` = neg,
-    Obs = n, Category = val
-  )
+rr_by_age <- get_rr_by_group(subset_est)
 ```
 
 ```{r save results}
@@ -424,6 +343,112 @@ if (stan_redo) {
                                        paste0('age_sex_seroprev_', Sys.Date(), '.csv')))
 }
 ```
+
+## Supplemental analysis: seroprevalence and risk of seropositivity within additional age groups
+
+```{r epi data with addl age groups}
+# Juba age data
+ssd_ages <- fread(here::here('data', 'raw_data', 'population_data', 
+                             'ssd_urban_age_sex.csv'))
+ssd_ages[, men := sum(men/100*510000), by = age_cat]
+ssd_ages[, women := sum(women/100*510000), by = age_cat]
+ssd_ages <- unique(ssd_ages[, c('age_cat2', 'men', 'women')])
+setnames(ssd_ages, 'age_cat2', 'age_cat')
+
+# Juba serology data
+sero_dat <- sero_match[, c('sample_id', 'igg', 'age', 'sex')]
+
+# rename some variables
+setnames(sero_dat, 'sample_id', 'ind_id')
+
+# add infection status based on threshold
+sero_dat[, pos := ifelse(igg > seropos_thresh, 1, 0)]
+sero_dat[, neg := ifelse(igg < seropos_thresh, 1, 0)]
+
+# age categories
+age_cats <- c('[1,5)', '[5,10)', '[10,20)', '[20,30)', '[30,40)',
+              '[40,50)', '[50,65)', '[65,105)')
+age_cats_dt <- data.table(age_cat = age_cats,
+                          age_lower = c(1, 5, 10, 20, 30, 40, 50, 65),
+                          age_upper = c(5, 10, 20, 30, 40, 50, 65, 105))
+
+# summarize by age cat
+sero_dat[, age_cat := lapply(age, function(x) {
+  age_cats_dt[age_lower <= x & age_upper > x, age_cat]
+})]
+sero_dat$age_cat <- as.character(sero_dat$age_cat)
+
+# merge
+ssd_ages <- merge(age_cats_dt, ssd_ages, by = c('age_cat'))
+
+# find population-level proportions of age and sex
+ssd_age_cats <- get_pop_props(ssd_ages)
+```
+
+```{r stan for addl age groups}
+# set arguments
+run_id <- 'mild80-addl-ages'
+severity_probs <- severity_groups[['mild80']]
+message('Running analysis: ', run_id)
+ 
+# file to save to
+out_est_file <- here::here('data', 'generated_data', 'adjusted_prev', 
+                           paste0('seropos-', run_id, '.rds'))
+  
+# positive control validation data
+pos_controls <- get_pos_val_data(run_id, mgh_val_dat, severity_probs)
+  
+if (!file.exists(out_est_file) | stan_redo) {
+    seropos <- run_analysis_stan(
+      model_script = here::here('code', 'serosurvey-analysis.stan'),
+      dat = sero_dat[!is.na(sex)], # just the matched data
+      run_id = run_id,
+      coef_eqn = 'sex + age_cat',
+      pos_control = pos_controls[1],
+      neg_control = neg_control,
+      control_tp = pos_controls[2],
+      control_fp = control_fp,
+      pop_age_cats = ssd_age_cats,
+      age_ref = '[20,30)',
+      chains = n_chains,
+      iter = n_iter,
+      warmup = n_warmup,
+      control = list(
+        adapt_delta = p_delta,
+        max_treedepth = n_treedepth
+      ),
+      save_warmup = F,
+      redo = stan_redo
+    )
+    
+    saveRDS(seropos, out_est_file)
+    
+  } else {
+    seropos <- readRDS(out_est_file)
+  }
+
+# get estimates
+subset_est <- seropos$subset_est
+
+# overall seroprevalence by age and sex
+age_sex_sero_addl <- subset_est[var == 'Age' | var == 'sex']
+age_sex_sero_addl[, mean := mean(p, na.rm = T), by = 'val']
+age_sex_sero_addl[, lower := quantile(p, probs = .025, na.rm = T), by = 'val']
+age_sex_sero_addl[, upper := quantile(p, probs = .975, na.rm = T), by = 'val']
+age_sex_sero_addl <- unique(age_sex_sero_addl[, c('val', 'mean', 'lower', 'upper')])
+
+# relative risk by age and sex
+rr_by_age_addl <- get_rr_by_group(subset_est, age_ref = '[20,30)')
+
+# save results if these are a new model run
+if (stan_redo) {
+  write.csv(rr_by_age_addl, here::here('data', 'generated_data', 'adjusted_prev',
+                                paste0('rr_by_ages_addl_', Sys.Date(), '.csv')))
+  write.csv(age_sex_sero_addl, here::here('data', 'generated_data', 'adjusted_prev',
+                                       paste0('age_sex_seroprev_addl_', Sys.Date(), '.csv')))
+}
+```
+
 
 ## Table 1. Participant characteristics (interview data)
 
@@ -536,7 +561,7 @@ age_sex_sero[, `Seroprevalence (95% CrI)` := paste0(mean, ' (', lower, ' - ', up
 age_sex_sero[, (cols) := NULL]
 
 # combine
-tab2 <- cbind(rr_tab[, 2:5], age_sex_sero[, 2], rr_tab[, 6:7])
+tab2 <- cbind(rr_tab[, 2:5], age_sex_sero[, 2], rr_tab[, 6])
 
 # table
 table2 <- flextable(tab2) %>%
@@ -544,6 +569,39 @@ table2 <- flextable(tab2) %>%
   valign(valign = 'top')
 
 save_as_docx(table2, path = paste0(outdir, '/table2.docx'))
+```
+
+## Table S2. Relative risk and seropositivity by additional age groups
+
+```{r}
+# relative risk
+rr_tab2 <- data.table(rr_by_age_addl)
+rr_tab2[, row_order := c(1, 3, 4, 5, 6, 2, 7, 8, 9, 10)]
+setorderv(rr_tab2, 'row_order')
+rr_tab2[, row_order := NULL]
+rr_tab2[, Category := c('1 - 4 years', '5 - 9 years', '10 - 19 years', 
+                        '20 - 29 years', '30 - 39 years', '40 - 49 years',
+                        '50 - 64 years', '65 - 84 years', 'Female', 'Male')]
+
+# seropositivity
+age_sex_sero2 <- copy(age_sex_sero_addl)
+cols <- c('mean', 'lower', 'upper')
+age_sex_sero2[, row_order := c(9, 10, 1, 3, 4, 5, 6, 2, 7, 8)]
+setorderv(age_sex_sero2, 'row_order')
+age_sex_sero2[, row_order := NULL]
+age_sex_sero2[, (cols) := lapply(.SD, function(x) round(x, 3)*100), .SDcols = cols]
+age_sex_sero2[, `Seroprevalence (95% CrI)` := paste0(mean, ' (', lower, ' - ', upper, ')')]
+age_sex_sero2[, (cols) := NULL]
+
+# combine
+tab3 <- cbind(rr_tab2[, 2:5], age_sex_sero2[, 2], rr_tab2[, 6])
+
+# table
+table3 <- flextable(tab3) %>%
+  autofit() %>%
+  valign(valign = 'top')
+
+save_as_docx(table3, path = paste0(outdir, '/tableS2.docx'))
 ```
 
 ## Relative risk of seropositivity by occupation
