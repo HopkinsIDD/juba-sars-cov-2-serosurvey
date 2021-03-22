@@ -196,7 +196,6 @@ run_elisa_analysis <- function(save_file) {
   if (save_file) {
     filename <- here::here('data', 'generated_data', 'serology_data', 
                            'ssd_cleaned_elisa_results.csv')
-    message('Saving file: ', filename)
     write.csv(prelim, filename)
   }
   
@@ -271,38 +270,42 @@ clean_serodynamics_data <- function() {
 #' @param run_id id for run/experiment
 #' @param validation_data validation data from Boston cohort
 #' @param severity_data probability weights by severity
+#' @param sev_cat severity categories
+#' @param threshold threshold for seropositivity
 #' 
 #' @return input validation values for Stan model
 get_pos_val_data <- function(run_id,
                              validation_data, 
-                             severity_data) {
+                             severity_data,
+                             sev_cat,
+                             threshold) {
   
   # if we're not using all the positive control data, 
   # assign severity group proportions
   if (run_id != 'allpos') {
     
-    for (i in 1:length(severity_cats)) {
-      mgh_val_dat[severity == severity_cats[[i]], severity_prob := severity_probs[[i]]]
+    for (i in 1:length(sev_cat)) {
+      validation_data[severity == sev_cat[[i]], severity_prob := severity_data[[i]]]
     }
     
     # create positive control set by severity
-    pos_total <- round(nrow(mgh_val_dat[severity == 'Not Hospitalized'])/severity_probs[[1]])
-    all_totals <- round(pos_total*severity_probs)
-    keep_rows <- mgh_val_dat[severity_prob == severity_probs[[which(severity_cats == 'Not Hospitalized')]], 
+    pos_total <- round(nrow(validation_data[severity == 'Not Hospitalized'])/severity_data[[1]])
+    all_totals <- round(pos_total*severity_data)
+    keep_rows <- validation_data[severity_prob == severity_data[[which(sev_cat == 'Not Hospitalized')]], 
                              row_id]
     for (i in 2:4) {
       keep_rows <- c(keep_rows, 
-                     sample(mgh_val_dat[severity == severity_cats[[i]], row_id], all_totals[[i]]))
+                     sample(validation_data[severity == sev_cat[[i]], row_id], all_totals[[i]]))
     }
-    mgh_val_dat <- mgh_val_dat[row_id %in% keep_rows]
+    validation_data <- validation_data[row_id %in% keep_rows]
   }
   
   # number of positive controls from validation data
   # Iyer et al, 2020 and new mild/asymptomatic cohort data
-  pos_control <- nrow(mgh_val_dat)
+  pos_control <- nrow(validation_data)
   
   # true positive rate for cases
-  control_tp <- nrow(mgh_val_dat[igg > seropos_thresh])
+  control_tp <- nrow(validation_data[igg > threshold])
   
   # return
   return(c(pos_control, control_tp))
@@ -376,7 +379,7 @@ run_analysis_stan <- function(model_script,
                               pop_age_cats,
                               n_cores = detectCores() - 2,
                               sex_ref = 0,
-                              age_ref = "[20,50)",
+                              age_ref = "[20,30)",
                               redo = F,
                               chains,
                               iter,
@@ -420,6 +423,7 @@ run_analysis_stan <- function(model_script,
                            p_vars = ncol(X),
                            X = X,
                            survey_pos = ana_dat$pos,
+                           N = 1000, # times we sampled the positive control dataset
                            N_pos_control = pos_control,
                            control_tp = control_tp,
                            N_neg_control = neg_control,
@@ -535,7 +539,7 @@ run_analysis_stan <- function(model_script,
 #' @param age_ref reference category for age
 #' 
 #' @return relative risk table
-get_rr_by_group <- function(est, age_ref = '[20,50)') {
+get_rr_by_group <- function(est, age_ref = '[20,30)') {
   est %>%
     filter(var == 'Age') %>%
     group_by(sim) %>%

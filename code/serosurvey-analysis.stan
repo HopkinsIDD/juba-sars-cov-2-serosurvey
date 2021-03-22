@@ -5,14 +5,23 @@
 // We have input data from a validation set (which determines the diagnostic performance) 
 // and the survey (from which we'd like to estimate seropos).
 data {
-    int<lower=1> N_survey; //numbber of participants in the survey
-    int<lower=0> survey_pos[N_survey]; //observation positive or negative
-    int<lower=1> p_vars; //number of variables to adjust for
-    matrix[N_survey, p_vars] X; //covariate model matrix (age, sex, week in these analyses)
-    int<lower=0> N_pos_control; //number of positive controls in the validation data
-    int<lower=0,upper=N_pos_control> control_tp; // number of true positive tests in the validation data
+    int<lower=1> N_survey; // number of participants in the survey
+    int<lower=0> survey_pos[N_survey]; // observation positive or negative
+    int<lower=1> p_vars; // number of variables to adjust for
+    matrix[N_survey, p_vars] X; // covariate model matrix (age, sex, week in these analyses)
+
+    int<lower = 0> N; // number of times we sampled with positive controls
+    int N_pos_control[N]; // array of number of positive controls in the validation data
+    int control_tp[N]; // array of number of true positive tests in the validation data
+
     int<lower=0> N_neg_control; // number of negative controls in the validation data
     int<lower=0,upper=N_neg_control> control_fp;// number of false positives by the diagnostic test in the validation study
+}
+
+transformed data {
+  simplex[N] uniform = rep_vector(1.0 / N, N);
+  int<lower = 1, upper = N> boot_idx;
+  boot_idx = categorical_rng(uniform); // sample one of the positive control ids
 }
 
 parameters {
@@ -32,7 +41,7 @@ transformed parameters {
 //  positive rate p*sens and false negative rate (1-p)*(1-spec).
 model {
     target+= bernoulli_lpmf(survey_pos | p*sens+(1-p)*(1-spec));
-    target+= binomial_lpmf(control_tp | N_pos_control, sens);
+    target+= binomial_lpmf(control_tp[boot_idx] | N_pos_control[boot_idx], sens);
     target+= binomial_lpmf(control_fp | N_neg_control, 1-spec);
     target+= normal_lpdf(beta | 0, 1) ;
 }

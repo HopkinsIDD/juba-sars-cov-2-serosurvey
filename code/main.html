@@ -1683,7 +1683,6 @@ summary {
 <pre><code>## Analyzing plate: R030</code></pre>
 <pre><code>## Analyzing plate: R031</code></pre>
 <pre><code>## Analyzing plate: R032</code></pre>
-<pre><code>## Saving file: /Users/kewiens/code/juba-sars-cov-2-serosurvey/data/generated_data/serology_data/ssd_cleaned_elisa_results.csv</code></pre>
 </div>
 <div id="load-serosurvey-interview-data-and-add-serology-results" class="section level2">
 <h2>Load serosurvey interview data and add serology results</h2>
@@ -1702,6 +1701,7 @@ summary {
 <div id="model-with-all-data-no-agesex-covariates" class="section level2">
 <h2>Model with all data (no age/sex covariates)</h2>
 <pre><code>## Running analysis: mild80-alldata</code></pre>
+<pre><code>## Assuming 80% mild infections, sensitivity is on average 65.5%</code></pre>
 </div>
 <div id="model-with-matched-data-no-agesex-covariates" class="section level2">
 <h2>Model with matched data (no age/sex covariates)</h2>
@@ -1727,11 +1727,17 @@ summary {
 <pre><code>## Joining, by = &quot;val&quot;</code></pre>
 <pre><code>## `summarise()` regrouping output by &#39;var&#39;, &#39;val&#39;, &#39;n&#39;, &#39;pos&#39; (override with `.groups` argument)</code></pre>
 </div>
-<div id="table-1.-participant-characteristics-interview-data" class="section level2">
-<h2>Table 1. Participant characteristics (interview data)</h2>
+<div id="table-1.-participant-characteristics" class="section level2">
+<h2>Table 1. Participant characteristics</h2>
 </div>
-<div id="table-s1.-seroprevalence-for-different-subsets-of-the-data" class="section level2">
-<h2>Table S1. Seroprevalence for different subsets of the data</h2>
+<div id="table-s1.-additional-participant-characteristics-risk-and-exposure-variables" class="section level2">
+<h2>Table S1. Additional participant characteristics: risk and exposure variables</h2>
+</div>
+<div id="table-s2-respiratory-symptoms-and-seropositivity" class="section level2">
+<h2>Table S2: Respiratory symptoms and seropositivity</h2>
+</div>
+<div id="table-s3.-seroprevalence-for-different-subsets-of-the-data" class="section level2">
+<h2>Table S3. Seroprevalence for different subsets of the data</h2>
 </div>
 <div id="table-2.-relative-risk-and-seropositivity-by-age-group" class="section level2">
 <h2>Table 2. Relative risk and seropositivity by age group</h2>
@@ -1754,17 +1760,17 @@ summary {
 <pre><code>## quartz_off_screen 
 ##                 2</code></pre>
 <pre><code>## Mild percent: 60</code></pre>
-<pre><code>## --&gt; Seroprevalence (95% CI): 34.8 (30.1 - 40.2)</code></pre>
+<pre><code>## --&gt; Seroprevalence (95% CI): 35.5 (30.3 - 41.4)</code></pre>
 <pre><code>## Mild percent: 80</code></pre>
-<pre><code>## --&gt; Seroprevalence (95% CI): 38.5 (32.1 - 46.8)</code></pre>
+<pre><code>## --&gt; Seroprevalence (95% CI): 38.3 (31.8 - 46.5)</code></pre>
 <pre><code>## Mild percent: 100</code></pre>
-<pre><code>## --&gt; Seroprevalence (95% CI): 45.6 (35.7 - 60.6)</code></pre>
+<pre><code>## --&gt; Seroprevalence (95% CI): 45.9 (35.9 - 61)</code></pre>
 <pre><code>## Mild percent: 60</code></pre>
-<pre><code>## --&gt; Ratio: 94 (81 - 109)</code></pre>
+<pre><code>## --&gt; Ratio: 96 (82 - 112)</code></pre>
 <pre><code>## Mild percent: 80</code></pre>
-<pre><code>## --&gt; Ratio: 104 (87 - 126)</code></pre>
+<pre><code>## --&gt; Ratio: 103 (86 - 126)</code></pre>
 <pre><code>## Mild percent: 100</code></pre>
-<pre><code>## --&gt; Ratio: 123 (96 - 164)</code></pre>
+<pre><code>## --&gt; Ratio: 124 (97 - 165)</code></pre>
 </div>
 <div id="figure-s2.-serodynamics-by-severity-in-boston-positive-controls" class="section level2">
 <h2>Figure S2. Serodynamics by severity in Boston positive controls</h2>
@@ -1781,11 +1787,6 @@ summary {
 <pre><code>## quartz_off_screen 
 ##                 2</code></pre>
 <pre><code>## 494/2214 (22.3%) of DBS samples were seropositive</code></pre>
-<pre><code>## quartz_off_screen 
-##                 2</code></pre>
-</div>
-<div id="figure-s4.-igg-distributions-by-age-group-in-juba" class="section level2">
-<h2>Figure S4. IgG distributions by age group in Juba</h2>
 <pre><code>## quartz_off_screen 
 ##                 2</code></pre>
 <pre><code>## R version 4.0.3 (2020-10-10)
@@ -1831,7 +1832,7 @@ summary {
 ## [53] plotrix_3.7-8      pkgbuild_1.2.0     zip_2.1.1          rlang_0.4.10      
 ## [57] pkgconfig_2.0.3    systemfonts_0.3.2  matrixStats_0.57.0 evaluate_0.14     
 ## [61] lattice_0.20-41    labeling_0.4.2     processx_3.4.5     tidyselect_1.1.0  
-## [65] here_0.1           magrittr_2.0.1     R6_2.5.0           generics_0.0.2    
+## [65] here_0.1           magrittr_2.0.1     R6_2.5.0           generics_0.1.0    
 ## [69] multcomp_1.4-15    DBI_1.1.0          mgcv_1.8-33        pillar_1.4.7      
 ## [73] haven_2.3.1        foreign_0.8-80     withr_2.4.0        survival_3.2-7    
 ## [77] abind_1.4-5        modelr_0.1.8       crayon_1.3.4       car_3.0-10        
